@@ -19,6 +19,32 @@ INSTANCE = os.environ.get("DEPLOY_INSTANCE", "i-bp18kchcnvcke6ltimn2")
 REGION = "cn-hangzhou"
 API_PORT = 9092
 
+NGINX_PATCH_SCRIPT = """from pathlib import Path
+path = Path("/etc/nginx/sites-enabled/api.imjson.cn")
+text = path.read_text()
+block = '''    # agent-ops-managed
+    location /agent-ops/ {
+        root /var/www;
+        index index.html;
+        try_files $uri $uri/ /agent-ops/index.html;
+    }
+    location /agent-ops/api/ {
+        proxy_pass http://127.0.0.1:9092/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 600s;
+    }
+    # agent-ops-managed-end
+'''
+anchor = "    # tactile-app-managed"
+if anchor not in text:
+    raise SystemExit("nginx anchor not found")
+path.write_text(text.replace(anchor, block + anchor, 1))
+print("nginx updated")
+"""
+
 
 def run_remote(cmd: str, wait: int = 8) -> tuple[str, str]:
     client = AcsClient(os.environ["ALIYUN_ACCESS_KEY_ID"], os.environ["ALIYUN_ACCESS_KEY_SECRET"], REGION)
@@ -47,6 +73,7 @@ def run_remote(cmd: str, wait: int = 8) -> tuple[str, str]:
 def build_remote_script(db_password: str, jwt_secret: str, clone_url: str) -> str:
     db_password_esc = db_password.replace("'", "'\"'\"'")
     jwt_secret_esc = jwt_secret.replace("'", "'\"'\"'")
+    nginx_b64 = base64.b64encode(NGINX_PATCH_SCRIPT.encode()).decode()
     return f"""#!/bin/bash
 set -euo pipefail
 export DATABASE_PASSWORD='{db_password_esc}'
@@ -116,32 +143,8 @@ chown -R root:root "$WEB_DIR"
 
 NGINX_CFG=/etc/nginx/sites-enabled/api.imjson.cn
 if ! grep -q '# agent-ops-managed' "$NGINX_CFG"; then
-  python3 -c '
-from pathlib import Path
-path = Path("/etc/nginx/sites-enabled/api.imjson.cn")
-text = path.read_text()
-block = """    # agent-ops-managed
-    location /agent-ops/ {{
-        root /var/www;
-        index index.html;
-        try_files $uri $uri/ /agent-ops/index.html;
-    }}
-    location /agent-ops/api/ {{
-        proxy_pass http://127.0.0.1:9092/api/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 600s;
-    }}
-    # agent-ops-managed-end
-"""
-anchor = "    # tactile-app-managed"
-if anchor not in text:
-    raise SystemExit("nginx anchor not found")
-path.write_text(text.replace(anchor, block + anchor, 1))
-print("nginx updated")
-'
+  echo {nginx_b64} | base64 -d > /tmp/patch_nginx.py
+  python3 /tmp/patch_nginx.py
   nginx -t && systemctl reload nginx
 else
   echo "nginx agent-ops block exists"
